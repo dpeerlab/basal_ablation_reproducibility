@@ -1,0 +1,321 @@
+---
+title: "Macrophage & Fibroblast condition DE — edgeR pseudobulk"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(anndata)
+  library(edgeR)
+  library(dplyr)
+  library(ggplot2)
+  library(Matrix)
+  library(ggrepel)
+  library(tibble)
+})
+
+h5ad_path <- 'st_data.h5ad'
+corr_path <- 'untreated_dc1_pearson_correlation.csv'
+res_dir   <- 'results/de'
+fig_dir   <- file.path(here::here(), 'figures/de')
+dir.create(res_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+MIN_CELLS  <- 10
+CELL_TYPES <- c("Macrophage", "Fibroblast")
+
+```
+
+# Load data
+
+```{r load_data}
+adata <- read_h5ad(h5ad_path)
+cat("Total cells:", nrow(adata$obs), "\n")
+cat("Total genes:", ncol(adata), "\n")
+```
+
+```{r subset_celltypes}
+ct_mask <- adata$obs$cell_annotation %in% CELL_TYPES
+adata_sub <- adata[ct_mask, ]
+cat("Cells after CT subset:", nrow(adata_sub$obs), "\n")
+print(table(adata_sub$obs$cell_annotation))
+```
+
+```{r assign_condition}
+obs <- adata_sub$obs %>%
+  mutate(
+    cond_group = case_when(
+      condition_num == 0  ~ "ctrl",
+      condition_num > 1   ~ "treated",
+      TRUE                ~ NA_character_
+    )
+  )
+
+cat("Condition group counts:\n")
+print(table(obs$cond_group, useNA = "always"))
+```
+
+# Compute percent expressed per gene per cell type
+
+```{r pct_expressed}
+counts_mat <- adata_sub$layers[["counts_segger"]]
+
+pct_expressed <- lapply(CELL_TYPES, function(ct) {
+  idx <- which(obs$cell_annotation == ct)
+  mat_ct <- counts_mat[idx, , drop = FALSE]
+  pct <- Matrix::colMeans(mat_ct > 0) * 100
+  data.frame(
+    gene          = colnames(counts_mat),
+    cell_type     = ct,
+    pct_expressed = as.numeric(pct),
+    stringsAsFactors = FALSE
+  )
+}) %>% bind_rows()
+```
+
+# Pseudobulk aggregation
+
+```{r filter_condition}
+keep <- !is.na(obs$cond_group)
+obs_f       <- obs[keep, ]
+counts_mat_f <- counts_mat[keep, , drop = FALSE]
+
+cat("Cells with assigned condition group:", nrow(obs_f), "\n")
+print(table(obs_f$cell_annotation, obs_f$cond_group))
+```
+
+```{r pseudobulk_fn}
+pseudobulk_ct <- function(ct) {
+  idx <- which(obs_f$cell_annotation == ct)
+  obs_ct    <- obs_f[idx, ]
+  mat_ct    <- counts_mat_f[idx, , drop = FALSE]
+
+  agg_key <- paste(obs_ct$sample_name, obs_ct$cond_group, sep = "__")
+  cell_counts <- table(agg_key)
+
+  keep_pb <- names(cell_counts)[cell_counts >= MIN_CELLS]
+  keep_cells <- agg_key %in% keep_pb
+
+  obs_ct  <- obs_ct[keep_cells, ]
+  mat_ct  <- mat_ct[keep_cells, , drop = FALSE]
+  agg_key <- agg_key[keep_cells]
+
+  pb_levels <- unique(agg_key)
+  pb_mat <- sapply(pb_levels, function(k) {
+    Matrix::colSums(mat_ct[agg_key == k, , drop = FALSE])
+  })
+
+  pb_meta <- obs_ct %>%
+    mutate(pb_key = agg_key) %>%
+    group_by(pb_key) %>%
+    summarise(
+      sample_name = first(sample_name),
+      cond_group  = first(cond_group),
+      n_cells     = n(),
+      .groups     = "drop"
+    ) %>%
+    arrange(match(pb_key, pb_levels))
+
+  list(counts = pb_mat, meta = pb_meta, cell_type = ct)
+}
+
+pb_list <- lapply(CELL_TYPES, pseudobulk_ct)
+names(pb_list) <- CELL_TYPES
+```
+
+```{r summarise_pb}
+for (ct in CELL_TYPES) {
+  cat("\n--- ", ct, " ---\n", sep = "")
+  print(table(pb_list[[ct]]$meta$cond_group))
+}
+```
+
+# edgeR DE
+
+```{r run_edger_fn}
+run_edgeR <- function(pb) {
+  mat  <- pb$counts
+  meta <- pb$meta
+  ct   <- pb$cell_type
+
+  group_counts <- table(meta$cond_group)
+  if (any(group_counts < 2)) {
+    warning(ct, ": fewer than 2 samples in a group, skipping.")
+    return(NULL)
+  }
+
+  meta$cond_group <- factor(meta$cond_group, levels = c("ctrl", "treated"))
+
+  dge <- DGEList(counts = mat, samples = meta, group = meta$cond_group)
+  dge <- calcNormFactors(dge, method = "TMM")
+
+  design <- model.matrix(~ cond_group, data = meta)
+  dge    <- estimateDisp(dge, design)
+  fit    <- glmQLFit(dge, design)
+  res    <- glmQLFTest(fit, coef = "cond_grouptreated")
+
+  tt <- topTags(res, n = Inf, sort.by = "none")$table %>%
+    rownames_to_column("gene") %>%
+    mutate(cell_type = ct)
+
+  tt
+}
+
+de_results <- lapply(pb_list, run_edgeR) %>%
+  Filter(Negate(is.null), .) %>%
+  bind_rows()
+```
+
+```{r join_pct}
+de_results <- de_results %>%
+  left_join(pct_expressed, by = c("gene", "cell_type"))
+
+head(de_results)
+```
+
+```{r load_correlation}
+corr_df <- read.csv(corr_path)
+
+de_results = left_join(de_results, corr_df,by = c('gene', 'cell_type'), suffix = c('.de', '.cor'))
+
+
+de_results <- de_results %>%
+  mutate(is_basal_corr = rho > .7 & pct_expressing > .1)
+
+cat("DE genes that are basal-correlated:", sum(de_results$is_basal_corr, na.rm = T), "\n")
+```
+
+# Summary
+
+```{r summary_stats}
+de_results %>%
+  group_by(cell_type) %>%
+  summarise(
+    n_genes_tested = n(),
+    n_sig_fdr05    = sum(FDR < 0.05, na.rm = TRUE),
+    n_sig_fdr01    = sum(FDR < 0.01, na.rm = TRUE)
+  )
+```
+
+# Volcano plot
+
+```{r volcano_fn}
+plot_volcano_tufte <- function(de_df, n_top = 10,
+                               pval_thresh = 0.1, lfc_thresh = 0.5,
+                               pct_expressed_thresh = 10,
+                               pct_expressing_thresh = 0.1,
+                               up_color = "#c0392b", dn_color = "#2980b9",
+                               ns_color = "#bdc3c7",
+                               basal_color = "#e74c3c") {
+  df <- de_df %>%
+    dplyr::filter(pct_expressed > pct_expressed_thresh) %>%
+    mutate(
+      neg_log10_fdr = -log10(pmax(FDR, 1e-300)),
+      direction = case_when(
+        FDR < pval_thresh & logFC > lfc_thresh  & pct_expressed > pct_expressed_thresh  ~ "up",
+        FDR < pval_thresh & logFC < -lfc_thresh & pct_expressed > pct_expressed_thresh  ~ "down",
+        TRUE ~ "ns"
+      )
+    )
+
+  # Top 10 up-regulated genes
+
+  top_up <- df %>% filter(direction == "up") %>%
+    slice_max(logFC, n = n_top, with_ties = FALSE)
+
+  # All basal-correlated down-regulated genes
+  basal_dn <- df %>% filter(direction == "down", is_basal_corr == TRUE)
+
+  to_label <- bind_rows(top_up, basal_dn) %>%
+    mutate(text_color = ifelse(is_basal_corr, basal_color, "black"))
+
+  n_up <- sum(df$direction == "up")
+  n_dn <- sum(df$direction == "down")
+
+  ggplot(df, aes(x = logFC, y = neg_log10_fdr, color = direction)) +
+    geom_point(size = 1.2, alpha = 0.7) +
+    scale_color_manual(values = c("up" = up_color, "down" = dn_color, "ns" = ns_color)) +
+    geom_hline(yintercept = -log10(pval_thresh), linetype = "dashed",
+               color = "#7f8c8d", linewidth = 0.5) +
+    geom_vline(xintercept = 0, linetype = "dotted",
+               color = "#7f8c8d", linewidth = 0.4) +
+    geom_text_repel(
+      data = to_label,
+      aes(label = gene),
+      color = to_label$text_color,
+      size = 2.5,
+      max.overlaps = 20,
+      segment.size = 0.3,
+      show.legend = FALSE
+    ) +
+    annotate("text", x = Inf, y = -Inf, label = paste0("↑ ", n_up),
+             hjust = 1.1, vjust = -0.5, size = 3, color = up_color) +
+    annotate("text", x = -Inf, y = -Inf, label = paste0("↓ ", n_dn),
+             hjust = -0.1, vjust = -0.5, size = 3, color = dn_color) +
+    labs(x = expression(log[2]~"fold change (late / early)"),
+         y = expression(-log[10]~FDR),
+         caption = "Red text = basal-correlated genes") +
+    theme_minimal(base_size = 11) +
+    theme(
+      legend.position = "none",
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(linewidth = 0.3, color = "gray90"),
+      axis.line = element_line(linewidth = 0.5),
+      strip.text = element_text(face = "bold", size = 12),
+      plot.caption = element_text(color = basal_color, size = 8, hjust = 1)
+    )
+}
+```
+
+
+
+```{r volcano_plot, fig.width=10, fig.height=5}
+gp <- de_results %>%
+  group_by(cell_type) %>%
+  group_map(~ plot_volcano_tufte(.x, pct_expressed_thresh = 4) + ggtitle(.y$cell_type), .keep = TRUE) %>%
+  patchwork::wrap_plots(ncol = 2)
+
+gp
+```
+
+```{r save_volcano}
+ggsave(file.path(fig_dir, 'mac_fib_DE_day0_vs_late_pctexp4.svg'), gp,
+       height = 5, width = 10)
+ggsave(file.path(fig_dir, 'mac_fib_DE_day0_vs_late_pctexp4.pdf'), gp,
+       height = 5, width = 10)
+```
+
+# Top DE genes
+
+```{r top_genes}
+de_results %>%
+  filter(FDR < 0.05) %>%
+  group_by(cell_type) %>%
+  #slice_max(abs(logFC), n = 20) %>%
+  arrange(cell_type, desc(abs(logFC))) %>%
+  select(cell_type, gene, logFC, FDR, pct_expressed, is_basal_corr)
+```
+
+# Save results
+
+```{r save_csv}
+out_path <- file.path(res_dir, "mac_fib_condition0_vs_gt1_edgeR.csv")
+write.csv(de_results, out_path, row.names = FALSE, quote = FALSE)
+cat("Saved:", out_path, "\n")
+```
+
+```{r read_csv}
+de_results = readr::read_csv(out_path)
+```
+
+
+# Session info
+
+```{r session_info}
+sessionInfo()
+```
