@@ -12,25 +12,25 @@ Below is a description of the directory contents.
 
 Code related to differential expression in Fig S4A. 
 
-*niche_emb*
+**niche_emb**
 
 Code related to filtering and construction of niche trajectories from niche embedding outputs of Wormhole. Notebooks relate to either the untreated setting (`notebooks/niche_emb/BA_mingle_untreated_niche_trajectory.ipynb`, Fig. 4B) or after ablation setting (`notebooks/niche_emb/BA_mingle_full_epi_trajectory_responsePruned.ipynb`, `notebooks/niche_emb/BA_mingle_classical_niche_trajectory.ipynb`, Fig. 6A-C). 
 
-*rl*
+**rl**
 
 Code related to ligand and receptor, effector cell frequency or composition, and gene to DC correlation analysis along untreated or classical response axis referenced in Fig. 4C-F, Fig. 5A, S3, S5, S7, S8. 
 
 # Scripts
 
-## Cell annotation
+**Cell annotation**
 
 Code used for general cell clustering and annotation of cell lineage (i.e. Myeloid) in Xenium data (`cluster_lineage.py`) or cancer state classifier using CellTypist (`train_cancer_state_classifier.py`). 
 
-## niche_emb
+**niche_emb**
 
 Code used to generate Wormhole embeddings in the untreated (`train_model_BA_untreated_20260514_a0.4_m25.py`) or ablation response (`train_model_BA_responsePruned_20260511_a0.4_m25.py`)settings. 
 
-## preprocessing
+**preprocessing**
 
 Scripts to:
 
@@ -41,11 +41,11 @@ Scripts to:
 
 # src
 
-## pl
+**pl**
 
 Helper functions for plotting ligand-receptor heatmaps. 
 
-## pp
+**pp**
 
 Functions related to niche filtering for trajectory construcion (`niche_purity.py`), cell clustering (`preprocess_rapids.py`), or scoring gene set expression (`signature_score.py`). 
 
