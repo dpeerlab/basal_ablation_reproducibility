@@ -1,0 +1,1776 @@
+---
+title: "Ligand–Receptor Recruitment Along the Untreated Niche Trajectory"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 5)
+```
+
+# Setup
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(anndata)
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(ggplot2)
+  library(ggthemes)
+  library(RColorBrewer)
+  library(patchwork)
+  library(here)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(data.table)
+})
+
+
+# Source helper functions
+source("basal_ablation/src/xenium_utils/pl/lr_heatmap_helpers.R")
+RETICULATE_PYTHON='.conda/envs/xenium-rapids/bin/python'
+
+# Paths
+CELLCHAT_PATH <- "ref_data/Mus_musculus/rl/CellChatDB.mouse.v2.rda"
+H5AD_PATH     <- "basal_ablation/data/processed/xenium/niche_trajectory_untreated_d24/st_data_untreated_niche_DC_all_cancerOnly_k50_env.h5ad"
+FIG_DIR       <- "basal_ablation/results/figures/chemokine_dc1/untreated_d24"
+SAVE_DIR      <- "basal_ablation/data/processed/xenium/niche_trajectory_untreated_d24"
+
+dir.create(FIG_DIR, recursive = TRUE, showWarnings = FALSE)
+
+rose_theme <- theme(
+  axis.text  = element_text(size = 13, color = "black"),
+  axis.title = element_text(size = 14, face = "bold")
+)
+
+X_LAB <- "Untreated niche trajectory (DC1)"
+
+# Cell-type level filters (Tier 1)
+MIN_PCT_CELLTYPE       <- 0.1    # min fraction cells expressing ligand within cell type
+MIN_LIG_CELLS_CELLTYPE <- 300     # min cells expressing ligand within cell type
+MIN_REC_FRAC_CELLTYPE  <- 0.05    # min receptor+ fraction within cell type
+
+# Chemokine gene lists
+CHEMOKINE_LIGANDS   <- c("Ccl2", "Ccl5", "Ccl17",
+                          "Cxcl9", "Cxcl10", "Cxcl12", "Cxcl13", "Cxcl16", "Mif")
+CHEMOKINE_RECEPTORS <- c("Ccr2", "Ccr4", "Ccr6", "Ccr7",
+                          "Cx3cr1", "Cxcr3", "Cxcr4", "Cxcr5", "Cxcr6", "Xcr1")
+
+# Type I IFN ligands
+IFN_I_LIGANDS <- c("Ifna2", "Ifna13", "Ifne", "Ifnb1")
+MIN_IFN_CELLS <- 30
+
+# Lineage map
+LINEAGE_MAP <- c(
+  Classical = 'Cancer',
+  Basal = 'Cancer',
+  Mesenchymal = 'Cancer',
+  Cancer_epithelial              = "Cancer",
+  `Cancer_epithelial_neuronal-like` = "Cancer",
+  Cancer_mesenchymal             = "Cancer",
+  Macrophage             = "Mac_Mono",
+  Monocyte               = "Mac_Mono",
+  cDC1                   = "DC",
+  cDC2                   = "DC",
+  mregDC                 = "DC",
+  pDC                    = "pDC",
+  Neutrophil             = "Neutrophil",
+  Granulocyte            = "Neutrophil",
+  Fibroblast             = "Fibroblast",
+  `Mesothelial/apCAF`    = 'Fibroblast',
+
+  PSC                    = "Fibroblast",
+  `Mesenchymal-like_stroma` = "Stroma",
+  Mesothelial            = "Stroma",
+  Mural                  = "Stroma",
+  Smooth_muscle          = "Stroma",
+  Adipocyte              = "Stroma",
+  Pericyte               = 'Stroma',
+  CD8_T                  = "T_NK_ILC",
+  Tconv                  = "T_NK_ILC",
+  NK                     = "T_NK_ILC",
+  Treg                   = "T_NK_ILC",
+  gdT                    = "T_NK_ILC",
+  gdT_CD8                = "T_NK_ILC",
+  MAIT                   = "T_NK_ILC",
+  `Innate-like_T`        = "T_NK_ILC",
+  ILC1                   = "T_NK_ILC",
+  ILC2                   = "T_NK_ILC",
+  ILC3                   = "T_NK_ILC",
+  NK_ILC1                = 'T_NK_ILC',
+  Lymphoid_proliferating = "T_NK_ILC",
+  B_cell                 = "B_Plasma",
+  Plasma_cell            = 'B_Plasma',
+  Plasmablast            = "B_Plasma",
+  Endothelial_vascular   = "Endothelial",
+  Endothelial_lymphatic  = "Endothelial",
+  Acinar                 = "Epithelial",
+  ADM                    = "Epithelial",
+  Ductal                 = "Epithelial",
+  Islet                  = "Epithelial",
+  `Tuft-like`            = "Epithelial",
+  Neuron                 = "Neural",
+  Schwann_cell           = "Neural"
+)
+
+# Bins for association analysis
+DC1_N_BINS <- 30
+ANALYSIS_BINS <- 9:28  # restrict to bins 9-28
+
+set.seed(42)
+```
+
+---
+
+# Introduction
+
+This notebook tests ligand → receptor recruitment relationships along the **untreated niche trajectory** (DC1). This axis captures the natural heterogeneity in the tumor microenvironment of untreated PDAC samples.
+
+**Statistical approach:** Tier1 (lm) and tier2 (local niche correlation) used to identify LR relationships. Environment cells are assigned DC1 bins matching cancer cell definitions, and analysis is restricted to bins 5-29.
+
+---
+
+# Data Loading
+
+## Load H5AD
+
+```{r load_h5ad}
+adata <- anndata::read_h5ad(H5AD_PATH)
+cat("Loaded:", H5AD_PATH, "\n")
+cat("Shape:", dim(adata), "\n")
+
+obs_df <- adata$obs
+var_names <- adata$var_names
+
+cat("\nCell annotations:\n")
+print(table(obs_df$cell_annotation))
+```
+
+## Build LR Pairs from CellChatDB
+
+```{r build_lr_pairs}
+e_cc   <- new.env()
+load(CELLCHAT_PATH, envir = e_cc)
+cc_int <- e_cc$CellChatDB.mouse$interaction
+
+# For each interaction, find the first receptor subunit gene present in the panel
+cc_int$receptor_gene <- sapply(cc_int$receptor.symbol, function(x) {
+  syms <- trimws(unlist(strsplit(x, ",")))
+  hit  <- syms[syms %in% adata$var_names]
+  if (length(hit) == 0) NA_character_ else hit[1]
+})
+
+LR_PAIRS <- cc_int[
+  cc_int$ligand %in% adata$var_names &
+  !is.na(cc_int$receptor_gene),
+  c("ligand", "receptor", "receptor.symbol", "receptor_gene", "pathway_name")
+]
+LR_PAIRS <- LR_PAIRS[!duplicated(paste(LR_PAIRS$ligand, LR_PAIRS$receptor_gene)), ]
+rownames(LR_PAIRS) <- NULL
+
+# Annotate chemokine pairs
+LR_PAIRS$is_chemokine <- LR_PAIRS$ligand %in% CHEMOKINE_LIGANDS &
+                          LR_PAIRS$receptor_gene %in% CHEMOKINE_RECEPTORS
+# Expanded: any pair with a chemokine ligand (regardless of receptor)
+LR_PAIRS$is_chemokine_expanded <- LR_PAIRS$ligand %in% CHEMOKINE_LIGANDS
+
+cat("LR pairs to test:", nrow(LR_PAIRS), "\n")
+cat("  of which chemokine LR:", sum(LR_PAIRS$is_chemokine), "\n")
+cat("  of which chemokine expanded:", sum(LR_PAIRS$is_chemokine_expanded), "\n")
+print(LR_PAIRS[LR_PAIRS$is_chemokine, c("ligand", "receptor_gene", "pathway_name")])
+```
+
+## Load Cytokine Signatures
+
+```{r load_cytokine_signatures}
+SIGNAL_ANNO_PATH <- "basal_ablation/data/features/xenium_panel/44CXV9_mPancreas_480g_gene_list_annotated.xlsx"
+
+gmt_to_list <- function(df) {
+  gene_col <- names(df)[1]
+  cyto_cols <- names(df)[-1]
+  out <- list()
+  for (cyto in cyto_cols) {
+    genes <- df[[gene_col]][df[[cyto]] == 1]
+    out[[cyto]] <- genes[!is.na(genes)]
+  }
+  out
+}
+
+signal_anno <- readxl::read_excel(SIGNAL_ANNO_PATH, sheet = "signal_anno")
+cytokine_signatures <- gmt_to_list(signal_anno)
+cat("Loaded", length(cytokine_signatures), "cytokine signatures\n")
+```
+
+---
+
+# Data Preparation
+
+## Compute DC1 Bins
+
+DC1_bin is computed the same way as in the Python notebook: using quantile binning (`pd.qcut` equivalent) on `DC_1_rank` for cancer cells, then assigning environment cells to bins based on their `DC_1_rank_env`.
+
+```{r compute_dc1_bins}
+# First check what columns exist
+cat("Available obs columns related to DC1:\n")
+print(grep("DC", names(obs_df), value = TRUE))
+
+# Compute DC1_bin using quantile binning on cancer cells' DC_1_rank
+# This mirrors: pd.qcut(adata.obs['DC_1_rank'], N_BINS, duplicates='drop')
+
+cancer_mask <- !is.na(obs_df$DC_1_rank)
+cancer_ranks <- obs_df$DC_1_rank[cancer_mask]
+
+cat("Cancer cells with DC_1_rank:", sum(cancer_mask), "\n")
+cat("DC_1_rank range:", range(cancer_ranks), "\n")
+
+# Create quantile breaks (N_BINS + 1 breaks for N_BINS bins)
+quantile_breaks <- quantile(cancer_ranks, probs = seq(0, 1, length.out = DC1_N_BINS + 1))
+
+# Handle duplicate breaks by making them unique (like duplicates='drop')
+quantile_breaks <- unique(quantile_breaks)
+n_actual_bins <- length(quantile_breaks) - 1
+
+cat("Quantile breaks (", n_actual_bins, "bins):\n")
+print(quantile_breaks)
+
+# Assign cancer cells to bins (0-indexed to match Python)
+obs_df$DC1_bin <- NA_integer_
+
+cancer_bin_assignments <- cut(
+  cancer_ranks,
+  breaks = quantile_breaks,
+  labels = FALSE,
+  include.lowest = TRUE
+) - 1  # Convert to 0-indexed
+
+obs_df$DC1_bin[cancer_mask] <- cancer_bin_assignments
+
+cat("\nCancer cell bin distribution:\n")
+print(table(obs_df$DC1_bin[cancer_mask]))
+
+# Assign environment cells based on DC_1_rank_env using same breaks
+env_mask <- is.na(obs_df$DC_1_rank) & !is.na(obs_df$DC_1_rank_env)
+cat("\nEnvironment cells to assign:", sum(env_mask), "\n")
+
+if (sum(env_mask) > 0) {
+  env_ranks <- obs_df$DC_1_rank_env[env_mask]
+
+  env_bin_assignments <- cut(
+    env_ranks,
+    breaks = quantile_breaks,
+    labels = FALSE,
+    include.lowest = TRUE
+  ) - 1  # Convert to 0-indexed
+
+  # Handle values outside the range
+  env_bin_assignments[env_ranks < min(quantile_breaks)] <- 0
+  env_bin_assignments[env_ranks > max(quantile_breaks)] <- n_actual_bins - 1
+
+  obs_df$DC1_bin[env_mask] <- env_bin_assignments
+
+  cat("Environment cell bin distribution:\n")
+  print(table(obs_df$DC1_bin[env_mask]))
+}
+
+# Use DC1_bin as the bin column (rename for consistency)
+obs_df$DC1_bin30 <- obs_df$DC1_bin
+
+cat("\nTotal cells with DC1_bin:", sum(!is.na(obs_df$DC1_bin)), "\n")
+cat("Unique bins:", length(unique(obs_df$DC1_bin[!is.na(obs_df$DC1_bin)])), "\n")
+```
+
+Analysis bins 0-4 will be filtered out because these are largely sample specific. 
+
+```{r filter_bins}
+
+
+ANALYSIS_BINS = 5:29
+# Filter to analysis bins (5-29)
+in_analysis <- obs_df$DC1_bin30 %in% ANALYSIS_BINS
+cat("Cells in analysis bins (", min(ANALYSIS_BINS), "-", max(ANALYSIS_BINS), "):",
+    sum(in_analysis, na.rm = TRUE), "/", nrow(obs_df), "\n")
+
+obs_df$in_analysis <- in_analysis
+```
+
+```{r extract_expression}
+# Extract count and log1p matrices
+counts_mat <- adata$layers[["counts_segger"]]
+log1p_mat  <- adata$layers[["log1p_norm"]]
+
+# Add receptor columns (raw counts + _pos)
+receptor_genes <- unique(LR_PAIRS$receptor_gene)
+receptor_in_panel <- receptor_genes[receptor_genes %in% var_names]
+receptor_idx <- match(receptor_in_panel, var_names)
+
+receptor_counts <- as.matrix(counts_mat[, receptor_idx])
+colnames(receptor_counts) <- receptor_in_panel
+receptor_pos <- receptor_counts >= 1
+colnames(receptor_pos) <- paste0(receptor_in_panel, "_pos")
+obs_df <- cbind(obs_df, receptor_counts, receptor_pos)
+
+# Define ligand genes for later
+ligand_genes <- unique(LR_PAIRS$ligand)
+
+# Add all features (log1p + counts)
+all_features <- adata$var_names
+rm_features <- c('GFP', 'tagBFP2', 'CreER')
+all_features <- all_features[!(all_features %in% rm_features)]
+feature_idx <- match(all_features, var_names)
+
+log1p_subset <- as.matrix(log1p_mat[, feature_idx])
+colnames(log1p_subset) <- paste0(all_features, "_log1p")
+counts_subset <- as.matrix(counts_mat[, feature_idx])
+colnames(counts_subset) <- paste0(all_features, "_counts")
+obs_df <- cbind(obs_df, log1p_subset, counts_subset)
+
+
+# Add library size
+obs_df$lib_size <- rowSums(counts_mat)
+obs_df$log_lib_size <- log1p(obs_df$lib_size)
+
+# Add lineage
+obs_df$lineage <- LINEAGE_MAP[obs_df$cell_annotation]
+obs_df$lineage[is.na(obs_df$lineage)] <- "Other"
+```
+
+## Define Sender/Receiver Cell Types
+
+```{r define_celltypes}
+# Cell types with >= 500 cells in analysis bins
+ct_counts <- obs_df %>%
+  dplyr::filter(in_analysis) %>%
+  dplyr::count(cell_annotation) %>%
+  dplyr::filter(n >= 500)
+
+SENDER_CELLTYPES   <- ct_counts$cell_annotation
+RECEIVER_CELLTYPES <- ct_counts$cell_annotation
+
+cat("Sender cell types (n >=500):", length(SENDER_CELLTYPES), "\n")
+cat("Receiver cell types (n >=500):", length(RECEIVER_CELLTYPES), "\n")
+print(SENDER_CELLTYPES)
+```
+
+---
+
+# Niche Quantity Precomputation
+
+## Cell-Type Level Counts
+
+```{r niche_precompute}
+# Load mingle connectivities
+mingle_conn <- adata$obsp[["mingle_connectivities"]]
+
+# --- Niche cell type counts (unchanged, already efficient) ---
+cat("Computing niche cell type counts...\n")
+for (ct in SENDER_CELLTYPES) {
+  ct_mask <- obs_df$cell_annotation == ct
+  ct_mask[is.na(ct_mask)] <- FALSE
+  col_name <- paste0("n_", gsub("[^A-Za-z0-9]", "_", ct), "_niche_ct")
+  obs_df[[col_name]] <- as.numeric(mingle_conn %*% as.numeric(ct_mask))
+}
+
+# --- Receptor+ niche counts by cell type (optimized) ---
+cat("Computing receptor+ niche counts by cell type...\n")
+
+# Build receptor_pos matrix (cells x receptors)
+receptor_pos_cols <- paste0(receptor_genes, "_pos")
+receptor_pos_cols <- receptor_pos_cols[receptor_pos_cols %in% names(obs_df)]
+receptor_pos_mat <- as.matrix(obs_df[, receptor_pos_cols, drop = FALSE])
+storage.mode(receptor_pos_mat) <- "numeric"
+
+# For each cell type, mask and multiply all receptors at once
+for (ct in RECEIVER_CELLTYPES) {
+  ct_mask <- obs_df$cell_annotation == ct
+  ct_mask[is.na(ct_mask)] <- FALSE
+
+  # Multiply: connectivity * (receptor_pos AND cell_type)
+  # Result is n_cells x n_receptors
+  masked_receptor <- receptor_pos_mat * ct_mask  # broadcast mask to all columns
+  niche_counts <- mingle_conn %*% masked_receptor
+
+  # Add columns with proper names
+  col_names <- paste0("n_", sub("_pos$", "", receptor_pos_cols), "_",
+                      gsub("[^A-Za-z0-9]", "_", ct), "_ct")
+  obs_df[, col_names] <- as.data.frame(as.matrix(niche_counts))
+}
+
+# Total niche size
+obs_df$n_niche_total <- rowSums(mingle_conn)
+cat("Niche precomputation complete.\n")
+```
+
+---
+
+# Bin-Level Aggregation
+
+## Sender Cell Type Bins (Ligand Expression)
+
+```{r sender_celltype_bins}
+sender_celltype_bins <- list()
+
+# Filter to analysis bins
+analysis_df <- obs_df %>% dplyr::filter(in_analysis)
+
+for (ct in SENDER_CELLTYPES) {
+  ct_df <- analysis_df %>% filter(cell_annotation == ct)
+  if (nrow(ct_df) < 50) next
+
+  # Get ligand count columns that exist
+  counts_cols <- paste0(ligand_genes, "_counts")
+  counts_cols <- counts_cols[counts_cols %in% names(ct_df)]
+  if (length(counts_cols) == 0) next
+
+  # Compute filtering stats for all ligands at once
+  lig_stats <- ct_df %>%
+    summarize(across(all_of(counts_cols),
+                     list(pct = ~mean(. > 0, na.rm = TRUE),
+                          n_cells = ~sum(. > 0, na.rm = TRUE))))
+
+  # Aggregate per bin for all ligands at once
+  bin_agg_all <- ct_df %>%
+    group_by(DC1_bin30) %>%
+    summarize(
+      n_sender = n(),
+      total_lib_size = sum(lib_size, na.rm = TRUE),
+      across(all_of(counts_cols),
+             list(n_lig_cells = ~sum(. > 0, na.rm = TRUE),
+                  sum_counts = ~sum(., na.rm = TRUE))),
+      .groups = "drop"
+    )
+
+  # Process each ligand's results (filtering + reshaping)
+  for (lig in ligand_genes) {
+    counts_col <- paste0(lig, "_counts")
+    if (!counts_col %in% counts_cols) next
+
+    # Check filtering thresholds
+    lig_pct <- lig_stats[[paste0(counts_col, "_pct")]]
+    lig_n_cells <- lig_stats[[paste0(counts_col, "_n_cells")]]
+    min_cells_thresh <- if (lig %in% IFN_I_LIGANDS) MIN_IFN_CELLS else MIN_LIG_CELLS_CELLTYPE
+    if (lig_pct < MIN_PCT_CELLTYPE && lig_n_cells < min_cells_thresh) next
+
+    # Extract this ligand's bin aggregation
+    bin_agg <- bin_agg_all %>%
+      transmute(
+        DC1_bin30,
+        n_sender,
+        n_lig_cells = .data[[paste0(counts_col, "_n_lig_cells")]],
+        lig_expr_bin = log1p(.data[[paste0(counts_col, "_sum_counts")]] / pmax(total_lib_size, 1))
+      )
+
+    key <- paste(ct, lig, sep = "__")
+    sender_celltype_bins[[key]] <- bin_agg
+  }
+}
+
+cat("Sender cell type bins:", length(sender_celltype_bins), "\n")
+```
+
+## Covariate Bins
+
+```{r cov_bins}
+cov_bins <- analysis_df %>%
+  filter(!is.na(DC_1_rank) | !is.na(DC_1_rank_env)) %>%
+  group_by(DC1_bin30) %>%
+  summarize(
+    n_cells = n(),
+    .groups = "drop"
+  )
+
+cat("Covariate bins:\n")
+print(cov_bins)
+```
+
+## Receptor Cell Type Bins
+
+Uses niche-level receptor counts from cancer cells' neighborhoods.
+
+```{r rec_celltype_bins}
+# First compute niche totals per bin (total niche cells across all cancer cells per bin)
+# so receptor positive cells near cancer cells
+cancer_analysis_df <- analysis_df %>% filter(!is.na(DC_1_rank))
+
+niche_totals_bin <- cancer_analysis_df %>%
+  group_by(DC1_bin30) %>%
+  summarize(n_niche_total_bin = sum(n_niche_total, na.rm = TRUE), .groups = "drop")
+
+# Receptor cell type bins using niche-level counts
+rec_celltype_bins <- list()
+
+for (rec in receptor_genes) {
+ for (ct in RECEIVER_CELLTYPES) {
+    # Column names for niche counts
+    ct_safe <- gsub("[^A-Za-z0-9]", "_", ct)
+    rec_col <- paste0("n_", rec, "_", ct_safe, "_ct")
+    ct_col <- paste0("n_", ct_safe, "_niche_ct")
+
+    if (!rec_col %in% names(cancer_analysis_df)) next
+    if (!ct_col %in% names(cancer_analysis_df)) next
+
+    tmp <- cancer_analysis_df %>%
+      group_by(DC1_bin30) %>%
+      summarize(
+        n_rec_total = sum(.data[[rec_col]], na.rm = TRUE),
+        n_ct_total = sum(.data[[ct_col]], na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      left_join(cov_bins, by = "DC1_bin30") %>%
+      left_join(niche_totals_bin, by = "DC1_bin30")
+
+    tmp$rec_frac_within_ct <- tmp$n_rec_total / pmax(tmp$n_ct_total, 1)
+    tmp$rec_frac_bin <- tmp$n_rec_total / pmax(tmp$n_niche_total_bin, 1)
+    tmp$rec_frac_within_ct_overall <- sum(tmp$n_rec_total, na.rm = TRUE) /
+                                       pmax(sum(tmp$n_ct_total, na.rm = TRUE), 1)
+
+    rec_celltype_bins[[paste(rec, ct, sep = "__")]] <- tmp
+  }
+}
+
+# Filter based on overall receptor+ fraction within cell type
+rec_celltype_bins <- Filter(
+  function(df) df$rec_frac_within_ct_overall[1] >= MIN_REC_FRAC_CELLTYPE,
+  rec_celltype_bins
+)
+
+cat("Receptor cell type bins after filtering:", length(rec_celltype_bins), "\n")
+```
+
+---
+
+# Filtering Diagnostics
+
+Compute expression metrics for all gene × cell_type combinations to help identify appropriate filtering thresholds.
+
+```{r filtering_diagnostics}
+# Vectorized function to compute filtering metrics for all gene × cell_type combinations
+compute_filtering_metrics <- function(df, genes, cell_types, col_name = "cell_annotation",
+                                       threshold = 0) {
+  # Filter to genes that exist in data
+  genes <- intersect(genes, names(df))
+  if (length(genes) == 0) return(data.frame())
+
+  # Filter to valid cell types
+  df <- df[!is.na(df[[col_name]]) & df[[col_name]] %in% cell_types, ]
+  if (nrow(df) == 0) return(data.frame())
+
+  # Compute n_total per cell type
+  n_total_df <- df %>%
+    group_by(cell_type = .data[[col_name]]) %>%
+    summarize(n_total = n(), .groups = "drop")
+
+  # Vectorized: compute expression stats for all genes at once
+  # Convert gene columns to binary (expressing or not)
+  expr_mat <- as.matrix(df[, genes, drop = FALSE]) > threshold
+
+  # Sum per cell type using matrix multiplication with indicator
+  ct_factor <- factor(df[[col_name]], levels = cell_types)
+  ct_indicator <- model.matrix(~ ct_factor - 1)
+  colnames(ct_indicator) <- levels(ct_factor)
+
+  # n_expressing = t(indicator) %*% expr_mat
+  n_expr_mat <- t(ct_indicator) %*% expr_mat
+
+  # Convert to long format
+  results <- expand.grid(cell_type = rownames(n_expr_mat), gene = colnames(n_expr_mat),
+                          stringsAsFactors = FALSE)
+  results$n_expressing <- as.vector(n_expr_mat)
+
+  # Join n_total
+  results <- results %>%
+    left_join(n_total_df, by = "cell_type") %>%
+    mutate(pct_expressing = n_expressing / n_total) %>%
+    filter(n_total > 0) %>%
+    select(gene, cell_type, pct_expressing, n_expressing, n_total)
+
+  results
+}
+
+# Get all LR genes
+all_lr_ligands <- unique(LR_PAIRS$ligand)
+all_lr_receptors <- unique(LR_PAIRS$receptor_gene)
+
+# Get ALL features with _counts columns (for general filtering)
+all_count_cols <- grep("_counts$", names(obs_df), value = TRUE)
+all_features <- gsub("_counts$", "", all_count_cols)
+
+# Create a df with all features for general metrics
+all_features_df <- obs_df[, c("cell_annotation", all_count_cols), drop = FALSE]
+names(all_features_df) <- c("cell_annotation", all_features)
+
+# All cell types in the data
+all_cell_types <- unique(obs_df$cell_annotation[!is.na(obs_df$cell_annotation)])
+
+# Compute metrics for ALL features across ALL cell types
+all_features_metrics <- compute_filtering_metrics(
+  all_features_df,
+  all_features,
+  all_cell_types,
+  threshold = 0
+)
+
+if (nrow(all_features_metrics) > 0) {
+  all_features_metrics$lineage <- LINEAGE_MAP[all_features_metrics$cell_type]
+}
+
+# Ligand metrics - use _counts columns directly
+# Build a subset df with just the counts columns, renamed to gene names
+ligand_count_cols <- paste0(all_lr_ligands, "_counts")
+ligand_count_cols <- ligand_count_cols[ligand_count_cols %in% names(obs_df)]
+ligand_genes_present <- gsub("_counts$", "", ligand_count_cols)
+
+# Create a temporary df with just cell_annotation and ligand counts (renamed)
+ligand_df <- obs_df[, c("cell_annotation", ligand_count_cols), drop = FALSE]
+names(ligand_df) <- c("cell_annotation", ligand_genes_present)
+
+# Ligand metrics (threshold = 0 to match sender_bins)
+ligand_metrics <- compute_filtering_metrics(
+  ligand_df,
+  ligand_genes_present,
+  SENDER_CELLTYPES,
+  threshold = 0
+)
+
+if (nrow(ligand_metrics) > 0) {
+  ligand_metrics$passes_pct <- ligand_metrics$pct_expressing >= MIN_PCT_CELLTYPE
+  ligand_metrics$passes_count <- ligand_metrics$n_expressing >= MIN_LIG_CELLS_CELLTYPE
+  ligand_metrics$passes_filter <- ligand_metrics$passes_pct | ligand_metrics$passes_count
+  ligand_metrics$lineage <- LINEAGE_MAP[ligand_metrics$cell_type]
+}
+
+# Receptor metrics (threshold = 1 to match receptor positivity)
+# Use raw receptor count columns (not _pos)
+receptor_genes_present <- all_lr_receptors[all_lr_receptors %in% names(obs_df)]
+
+# Create a temporary df with just cell_annotation and receptor counts
+receptor_df <- obs_df[, c("cell_annotation", receptor_genes_present), drop = FALSE]
+
+receptor_metrics <- compute_filtering_metrics(
+  receptor_df,
+  receptor_genes_present,
+  RECEIVER_CELLTYPES,
+  threshold = 1
+)
+
+if (nrow(receptor_metrics) > 0) {
+  receptor_metrics$passes_filter <- receptor_metrics$pct_expressing >= MIN_REC_FRAC_CELLTYPE
+  receptor_metrics$lineage <- LINEAGE_MAP[receptor_metrics$cell_type]
+}
+
+# Save for diagnostics
+write.csv(all_features_metrics, file.path(FIG_DIR, "all_features_celltype_filtering_metrics.csv"), row.names = FALSE)
+write.csv(ligand_metrics, file.path(FIG_DIR, "ligand_celltype_filtering_metrics.csv"), row.names = FALSE)
+write.csv(receptor_metrics, file.path(FIG_DIR, "receptor_celltype_filtering_metrics.csv"), row.names = FALSE)
+
+cat("All features metrics:", nrow(all_features_metrics), "gene × cell_type combinations\n")
+cat("  Unique genes:", length(unique(all_features_metrics$gene)), "\n")
+cat("  Unique cell types:", length(unique(all_features_metrics$cell_type)), "\n")
+cat("Ligand metrics:", nrow(ligand_metrics), "gene × cell_type combinations\n")
+cat("  Passing filter:", sum(ligand_metrics$passes_filter, na.rm = TRUE), "\n")
+cat("Receptor metrics:", nrow(receptor_metrics), "gene × cell_type combinations\n")
+cat("  Passing filter:", sum(receptor_metrics$passes_filter, na.rm = TRUE), "\n")
+```
+
+
+# Feature Correlation with DC1
+
+## Ligand Correlations
+
+```{r ligand_dc1_correlation}
+# Correlate bin-level gene expression with DC bin number for each cell type
+dc1_corr_results <- list()
+
+COR_CELLTYPES = c('Cancer_epithelial', 'Fibroblast', 'Macrophage')
+
+for (ct in COR_CELLTYPES) {
+  ct_df <- analysis_df %>%
+    filter(cell_annotation == ct, !is.na(DC1_bin30))
+
+  if (nrow(ct_df) < 100) next
+
+  # Get all log1p columns
+  log1p_cols <- paste0(all_features, "_log1p")
+  log1p_cols <- log1p_cols[log1p_cols %in% names(ct_df)]
+
+  # Aggregate expression by bin for all genes at once
+  bin_agg <- ct_df %>%
+    group_by(DC1_bin30) %>%
+    summarize(
+      n_cells = n(),
+      across(all_of(log1p_cols), ~mean(., na.rm = TRUE)),
+      .groups = "drop"
+    )
+
+  # Correlate each gene's bin-level expression with bin number
+  for (gene in all_features) {
+    gene_col <- paste0(gene, "_log1p")
+    if (!gene_col %in% names(bin_agg)) next
+
+    bin_expr <- bin_agg[[gene_col]]
+    bin_nums <- bin_agg$DC1_bin30
+
+    # Skip if no variance
+    if (sd(bin_expr, na.rm = TRUE) == 0) next
+
+    valid_idx <- !is.na(bin_expr) & !is.na(bin_nums)
+    if (sum(valid_idx) < 5) next
+
+    cor_test <- cor.test(bin_nums[valid_idx], bin_expr[valid_idx], method = "spearman")
+
+    dc1_corr_results[[length(dc1_corr_results) + 1]] <- data.frame(
+      cell_type = ct,
+      gene = gene,
+      rho = cor_test$estimate,
+      pval = cor_test$p.value,
+      n_bins = sum(valid_idx),
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+dc1_corr_df <- bind_rows(dc1_corr_results)
+dc1_corr_df$padj <- p.adjust(dc1_corr_df$pval, method = "BH")
+
+cat("DC1 bin-level correlation tests:", nrow(dc1_corr_df), "\n")
+```
+
+```{r}
+# write out results joining to expression statistics
+dc1_corr_df = dplyr::left_join(dc1_corr_df, all_features_metrics, by = c('cell_type', 'gene'))
+write.csv(dc1_corr_df, file.path(FIG_DIR, 'untreated_dc1_spearman_correlation.csv'), row.names = F, quote = F)
+```
+
+```{r}
+# read in 
+dc1_corr_df = readr::read_csv(file.path(FIG_DIR, 'untreated_dc1_spearman_correlation.csv'))
+```
+
+```{r}
+
+dc1_corr_df %>% dplyr::filter(pct_expressing > MIN_PCT_CELLTYPE) %>% View()
+```
+
+```{r}
+nrow(dc1_corr_df)
+```
+
+```{r}
+dc1_corr_df %>% dplyr::filter(pct_expressing > MIN_PCT_CELLTYPE & abs(rho) > .7) %>% nrow()
+```
+
+
+## Correlated feature heatmap
+
+```{r correlated_ligand_heatmap_function}
+# Function to create DC1-correlated feature heatmap for a given cell type
+plot_dc1_correlated_heatmap <- function(ct_name, dc1_corr_df, obs_df, top_n = 20, pct_filter = .1, add_genes = "",
+                                        rho_threshold = 0.7,
+                                        file_suffix = "_dc1_correlated_features_heatmap.svg") {
+  # Get top N positive and top N negative correlated genes
+  pos_genes <- dc1_corr_df %>%
+    filter(cell_type == ct_name & rho > rho_threshold & pct_expressing > pct_filter) %>%
+    arrange(desc(rho)) %>%
+    head(top_n)
+
+  neg_genes <- dc1_corr_df %>%
+    filter(cell_type == ct_name & rho < -rho_threshold & pct_expressing > pct_filter) %>%
+    arrange(rho) %>%
+    head(top_n)
+
+  # Handle add_genes separately - assign to pos/neg based on actual rho
+  if (length(add_genes) > 0 && !all(add_genes == "")) {
+    add_genes_df <- dc1_corr_df %>%
+      filter(cell_type == ct_name, gene %in% add_genes)
+    pos_genes <- bind_rows(pos_genes, add_genes_df %>% filter(rho >= 0)) %>% distinct(gene, .keep_all = TRUE)
+    neg_genes <- bind_rows(neg_genes, add_genes_df %>% filter(rho < 0)) %>% distinct(gene, .keep_all = TRUE)
+  }
+
+  corr_genes_df <- bind_rows(pos_genes, neg_genes)
+
+  cat("\n", ct_name, ":\n")
+  cat("  Top", top_n, "positive:", nrow(pos_genes), "\n")
+  cat("  Top", top_n, "negative:", nrow(neg_genes), "\n")
+
+  if (nrow(corr_genes_df) == 0) {
+    cat("  No correlated genes found.\n")
+    return(NULL)
+  }
+
+  # Get cells in analysis bins
+  ct_analysis_df <- obs_df %>%
+    filter(cell_annotation == ct_name, in_analysis)
+
+  corr_genes <- corr_genes_df$gene
+
+  # Compute bin-level mean expression
+  ct_bin_expr <- ct_analysis_df %>%
+    group_by(DC1_bin30) %>%
+    summarize(
+      n_cells = n(),
+      across(all_of(paste0(corr_genes, "_log1p")), ~mean(., na.rm = TRUE)),
+      .groups = "drop"
+    )
+
+  # Build matrix
+  bin_ids <- sort(unique(ct_bin_expr$DC1_bin30))
+  n_bins <- length(bin_ids)
+  bin_centres <- (bin_ids - 0.5) / DC1_N_BINS
+
+  mat <- matrix(NA, nrow = length(corr_genes), ncol = n_bins)
+  rownames(mat) <- corr_genes
+  colnames(mat) <- sprintf("%.2f", bin_centres)
+
+  for (gene in corr_genes) {
+    col_name <- paste0(gene, "_log1p")
+    if (col_name %in% names(ct_bin_expr)) {
+      mat[gene, ] <- ct_bin_expr[[col_name]]
+    }
+  }
+
+  # Row groups by correlation direction
+  row_groups <- ifelse(corr_genes_df$rho > 0, "DC1 Positive", "DC1 Negative")
+  row_groups <- factor(row_groups, levels = c("DC1 Positive", "DC1 Negative"))
+  
+  print(head(mat))
+
+  # Z-score normalize
+  mat_z <- t(apply(mat, 1, function(x) {
+    s <- sd(x, na.rm = TRUE)
+    if (is.na(s) || s == 0) return(rep(0, length(x)))
+    (x - mean(x, na.rm = TRUE)) / s
+  }))
+
+  # Smooth with 3-bin rolling average
+  mat_smooth <- mat_z
+  for (i in seq_len(nrow(mat_smooth))) {
+    for (j in seq_len(ncol(mat_smooth))) {
+      neighbors <- max(1, j-1):min(ncol(mat_smooth), j+1)
+      mat_smooth[i, j] <- mean(mat_z[i, neighbors], na.rm = TRUE)
+    }
+  }
+
+  col_fun <- colorRamp2(c(-2, 0, 2), c("#4575b4", "white", "#d73027"))
+
+  ht <- Heatmap(
+    mat_smooth,
+    col = col_fun,
+    name = "Z-score",
+    row_split = row_groups,
+    row_title_rot = 0,
+    row_title_gp = gpar(fontsize = 10, fontface = "bold"),
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    show_row_names = TRUE,
+    row_names_side = "left",
+    row_names_gp = gpar(fontsize = 8),
+    show_column_names = FALSE,
+    column_title = X_LAB,
+    column_title_side = "bottom",
+    rect_gp = gpar(col = "lightgrey", lwd = 0.3),
+    na_col = "grey90",
+    row_gap = unit(2, "mm"),
+    use_raster = FALSE
+  )
+
+  plot_title <- paste0("DC1-Correlated Features (", ct_name, ", top ", top_n, " each direction)")
+
+  # Draw
+
+  draw(ht,
+       column_title = plot_title,
+       column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+       padding = unit(c(2, 2, 2, 2), "mm"))
+
+  # Save SVG
+  ct_safe <- gsub("[^A-Za-z0-9]", "_", tolower(ct_name))
+  svg_path <- file.path(FIG_DIR, paste0(ct_safe, file_suffix))
+  n_rows <- nrow(mat_smooth)
+  pdf(svg_path, width = 10, height = max(6, n_rows * 0.25 + 2))
+  draw(ht,
+       column_title = plot_title,
+       column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+       padding = unit(c(2, 2, 2, 2), "mm"))
+  dev.off()
+  cat("  Saved:", svg_path, "\n")
+
+  invisible(ht)
+}
+```
+
+```{r correlated_heatmap_cancer, fig.width=10, fig.height=12}
+plot_dc1_correlated_heatmap("Cancer_epithelial", dc1_corr_df, obs_df, top_n = 20, rho_threshold = .7, file_suffix = '_dc1_correlated_features_heatmap.pdf')
+```
+
+```{r correlated_heatmap_macrophage, fig.width=10, fig.height=12}
+plot_dc1_correlated_heatmap("Macrophage", dc1_corr_df, obs_df, top_n = 20, rho_threshold = .7, file_suffix = '_dc1_correlated_features_heatmap.pdf')
+```
+
+```{r correlated_heatmap_fibroblast, fig.width=10, fig.height=12}
+plot_dc1_correlated_heatmap("Fibroblast", dc1_corr_df, obs_df, top_n = 20, rho_threshold = .7, file_suffix = '_dc1_correlated_features_heatmap.pdf')
+```
+
+### filtered features heatmaps for main
+
+```{r}
+fib_genes = c('Pi16', 'Pdgfra', 'Cd34', 'Gli1', 'Eng', 'Igf1', # classical associated
+              'Tnc', 'Acta2', 'Fap', 'Thbs1', 'Plaur', 'Pdgfrb') # basal associated
+
+plot_dc1_correlated_heatmap("Fibroblast", dc1_corr_df %>% dplyr::filter(gene %in% fib_genes), obs_df, top_n = 20, pct_filter = .05, file_suffix = "_dc1_correlated_select_features_heatmap.svg")
+```
+
+```{r}
+mac_genes = c('Folr2', 'C1qb', 'Mafb', 'Clec10a', 'Cx3cr1', 'Trem2',  # classical associated
+              'Arg1', 'Axl', 'Fabp4', 'Itgax', 'Plaur', 'Thbs1') # basal associated
+
+plot_dc1_correlated_heatmap("Macrophage", dc1_corr_df %>% dplyr::filter(gene %in% mac_genes), obs_df, top_n = 20, pct_filter = .05, file_suffix = "_dc1_correlated_select_features_heatmap.svg")
+```
+
+
+```{r}
+cancer_genes = c('Lgals4', 'Agr2', 'Tspan8', 'Sox9', 'Lrp5', 'Wnt4',  # classical associated
+              'Slc4a11', 'Krt17', 'Lamc2', 'Lamb3', 'Itga5', 'Itgb1') # basal associated
+
+plot_dc1_correlated_heatmap("Cancer_epithelial", dc1_corr_df %>% dplyr::filter(gene %in% cancer_genes), obs_df, top_n = 20, pct_filter = .05, file_suffix = "_dc1_correlated_select_features_heatmap.svg")
+```
+
+---
+
+---
+
+# Linear Model Testing (Tier 1)
+
+Testing for relationship between expression and receptor positive cells. 
+
+
+```{r lm_tier1}
+# Test cell-type level associations
+lm_results <- list()
+
+for (i in seq_len(nrow(LR_PAIRS))) {
+  lig <- LR_PAIRS$ligand[i]
+  rec <- LR_PAIRS$receptor_gene[i]
+  pathway <- LR_PAIRS$pathway_name[i]
+  is_chemo <- LR_PAIRS$is_chemokine[i]
+  is_chemo_exp <- LR_PAIRS$is_chemokine_expanded[i]
+
+  # Test all sender-receiver cell type combinations
+  for (sender_ct in SENDER_CELLTYPES) {
+    sender_key <- paste(sender_ct, lig, sep = "__")
+    if (!sender_key %in% names(sender_celltype_bins)) next
+    sender_df <- sender_celltype_bins[[sender_key]]
+
+    for (receiver_ct in RECEIVER_CELLTYPES) {
+      rec_key <- paste(rec, receiver_ct, sep = "__")
+      if (!rec_key %in% names(rec_celltype_bins)) next
+      rec_df <- rec_celltype_bins[[rec_key]]
+
+      # Merge on bin
+      merged <- inner_join(sender_df, rec_df, by = "DC1_bin30", suffix = c("_lig", "_rec"))
+      if (nrow(merged) < 5) next
+
+      # Fit LM
+      fit <- tryCatch({
+        lm(rec_frac_bin ~ lig_expr_bin, data = merged)
+      }, error = function(e) NULL)
+
+      if (is.null(fit)) next
+
+      summ <- summary(fit)
+      coef_df <- coef(summ)
+
+      if (!"lig_expr_bin" %in% rownames(coef_df)) next
+
+      lm_results[[length(lm_results) + 1]] <- data.frame(
+        mode = "tier1",
+        sender_celltype = sender_ct,
+        receiver_celltype = receiver_ct,
+        ligand = lig,
+        receptor = rec,
+        pathway = pathway,
+        is_chemokine = is_chemo,
+        is_chemokine_expanded = is_chemo_exp,
+        slope = coef_df["lig_expr_bin", "Estimate"],
+        se = coef_df["lig_expr_bin", "Std. Error"],
+        tval = coef_df["lig_expr_bin", "t value"],
+        pval = coef_df["lig_expr_bin", "Pr(>|t|)"],
+        r2 = summ$r.squared,
+        n_bins = nrow(merged),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+}
+
+lm_df_tier1 <- bind_rows(lm_results)
+lm_df_tier1$padj <- p.adjust(lm_df_tier1$pval, method = "BH")
+
+# join to receptor and ligand expression information
+lm_df_tier1 = left_join(lm_df_tier1, ligand_metrics %>% dplyr::select(gene, cell_type, pct_expressing, n_expressing), 
+                        by = c('ligand' = 'gene', 'sender_celltype' = 'cell_type')) %>%
+  left_join(receptor_metrics %>% dplyr::select(gene, cell_type, pct_expressing, n_expressing), 
+                        by = c('receptor' = 'gene', 'receiver_celltype' = 'cell_type'), 
+            suffix= c('.ligand', '.receptor'))
+
+
+cat("Tier 1 tests:", nrow(lm_df_tier1), "\n")
+cat("Significant (padj < 0.05):", sum(lm_df_tier1$padj < 0.05), "\n")
+cat("Positive associations:", sum(lm_df_tier1$padj < 0.05 & lm_df_tier1$slope > 0), "\n")
+```
+
+```{r save_lm_results}
+# Save results
+write.csv(lm_df_tier1, file.path(SAVE_DIR, "lr_dc1_lm_results_tier1.csv"), row.names = FALSE)
+cat("Saved results to:", file.path(SAVE_DIR, "lr_dc1_lm_results_tier1.csv"), "\n")
+```
+
+```{r}
+# read in 
+lm_df_tier1 = read.csv(file.path(SAVE_DIR, "lr_dc1_lm_results_tier1.csv"), h = T, stringsAsFactors = F)
+```
+
+## representative scatterplot
+
+```{r representative_scatterplot, fig.width=6, fig.height=5}
+# Representative scatterplot: Cancer_epithelial Pdgfb -> PSC Pdgfrb
+sender_ct <- "Cancer_epithelial"
+receiver_ct <- "Fibroblast"
+lig <- "Tgfb1"
+rec <- "Tgfbr2"
+
+# Get sender and receiver bin data
+sender_key <- paste(sender_ct, lig, sep = "__")
+rec_key <- paste(rec, receiver_ct, sep = "__")
+
+sender_df <- sender_celltype_bins[[sender_key]]
+rec_df <- rec_celltype_bins[[rec_key]]
+
+# Merge on bin
+plot_df <- inner_join(sender_df, rec_df, by = "DC1_bin30", suffix = c("_lig", "_rec"))
+
+# Create scatterplot with regression line and plasma color palette
+ggplot(plot_df, aes(x = lig_expr_bin, y = rec_frac_bin, color = DC1_bin30)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linetype = "dashed") +
+  scale_color_viridis_c(option = "plasma", name = "DC1 Bin") +
+  labs(
+    x = paste0(sender_ct, " ", lig, " expression (log1p)"),
+    y = paste0(rec, "+ fraction in niche (", receiver_ct, ")"),
+    title = paste0("Ligand-Receptor Association: ", lig, " -> ", rec),
+    subtitle = paste0("Sender: ", sender_ct, " | Receiver: ", receiver_ct)
+  ) +
+  theme_minimal() +
+  rose_theme +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(size = 12, face = "bold"),
+    plot.subtitle = element_text(size = 10)
+  )
+
+# Save figure
+ggsave(file.path(FIG_DIR, "representative_lr_scatterplot_tgfb1_tgfbr2.pdf"),
+       width = 6, height = 5)
+```
+
+
+
+---
+
+
+# Tier 2 with Spatial Connectivities (60μm radius)
+
+Compare niche-level correlations using `spatial_connectivities` (60μm radius neighbors) vs `mingle_connectivities` (32 kNN). Larger neighborhoods may capture longer-range signaling (e.g., chemokine diffusion).
+
+
+## load niche ligand data
+
+```{r load_niche_ligand}
+
+niche_lig_sp_df = arrow::read_parquet(file.path(SAVE_DIR, 'st_data_untreated_niche_DC_all_cancerOnly_k50_env_pseudobulk_celltype_expression_spatialConn.parquet'))
+setDT(niche_lig_sp_df)
+```
+
+
+## Precompute Niche Receptor Fractions
+
+```{r load_niche_receptor}
+
+niche_pos_sp_df = arrow::read_parquet(file.path(SAVE_DIR, 'st_data_untreated_niche_DC_all_cancerOnly_k50_env_gene_positivity_spatialConn.parquet'))
+setDT(niche_pos_sp_df)
+```
+
+## Tier 2 Correlation Testing (Spatial Connectivities)
+
+```{r tier2_spatial_correlation_test}
+cat("Running Tier 2 correlation tests with spatial_connectivities (60μm radius)...\n")
+
+# Filter to cancer cells in analysis bins
+cancer_tier2_df <- obs_df %>%
+  filter(!is.na(DC_1_rank), in_analysis)
+
+cancer_barcodes <- cancer_tier2_df$barcode
+n_cancer <- length(cancer_barcodes)
+
+# Filter parquet data to cancer cells
+niche_pos_sp_df.cancer <- niche_pos_sp_df[barcode %in% cancer_barcodes]
+niche_lig_sp_df.cancer <- niche_lig_sp_df[barcode %in% cancer_barcodes]
+
+cat("Cancer cells for Tier 2 spatial testing:", n_cancer, "\n")
+
+# Pre-index barcode positions for matrix construction
+barcode_idx <- setNames(seq_along(cancer_barcodes), cancer_barcodes)
+
+# Get LR genes
+ligand_genes <- unique(LR_PAIRS$ligand)
+receptor_genes <- unique(LR_PAIRS$receptor_gene)
+
+tier2_sp_results <- list()
+
+# Loop through cell type pairs first (fewer subsets)
+for (sender_ct in SENDER_CELLTYPES) {
+  print(sender_ct)
+  # Subset ligand expression for this sender cell type (all genes at once)
+  lig_ct_subset <- niche_lig_sp_df.cancer[cell_type == sender_ct & gene %in% ligand_genes]
+
+  if (nrow(lig_ct_subset) == 0) next
+
+  # Pivot to matrix: rows = barcodes, cols = genes
+  lig_mat <- matrix(0, nrow = n_cancer, ncol = length(ligand_genes),
+                    dimnames = list(cancer_barcodes, ligand_genes))
+  for (g in intersect(ligand_genes, unique(lig_ct_subset$gene))) {
+    g_subset <- lig_ct_subset[gene == g]
+    lig_mat[barcode_idx[g_subset$barcode], g] <- g_subset$value
+  }
+
+  for (receiver_ct in RECEIVER_CELLTYPES) {
+    # Subset receptor fraction for this receiver cell type (all genes at once)
+    rec_ct_subset <- niche_pos_sp_df.cancer[cell_type == receiver_ct & gene %in% receptor_genes]
+
+    if (nrow(rec_ct_subset) == 0) {
+      # Record NA for all LR pairs with this cell type combo
+      for (i in seq_len(nrow(LR_PAIRS))) {
+        lig <- LR_PAIRS$ligand[i]
+        if (!lig %in% colnames(lig_mat) || sum(lig_mat[, lig] > 0) == 0) next
+        tier2_sp_results[[length(tier2_sp_results) + 1]] <- data.frame(
+          sender_celltype = sender_ct,
+          receiver_celltype = receiver_ct,
+          ligand = lig,
+          receptor = LR_PAIRS$receptor_gene[i],
+          tier2_sp_rho_spearman = NA_real_,
+          tier2_sp_pval_spearman = NA_real_,
+          tier2_sp_rho_pearson = NA_real_,
+          tier2_sp_pval_pearson = NA_real_,
+          tier2_sp_n_cells = n_cancer,
+          tier2_sp_n_lig_nonzero = sum(lig_mat[, lig] > 0),
+          tier2_sp_n_rec_nonzero = 0L,
+          stringsAsFactors = FALSE
+        )
+      }
+      next
+    }
+
+    # Pivot to matrix: rows = barcodes, cols = genes
+    rec_mat <- matrix(0, nrow = n_cancer, ncol = length(receptor_genes),
+                      dimnames = list(cancer_barcodes, receptor_genes))
+    for (g in intersect(receptor_genes, unique(rec_ct_subset$gene))) {
+      g_subset <- rec_ct_subset[gene == g]
+      rec_mat[barcode_idx[g_subset$barcode], g] <- g_subset$fraction
+    }
+
+    # Now loop through LR pairs - just column extraction
+    for (i in seq_len(nrow(LR_PAIRS))) {
+      lig <- LR_PAIRS$ligand[i]
+      rec <- LR_PAIRS$receptor_gene[i]
+
+      # Check genes exist in matrices
+      if (!lig %in% colnames(lig_mat) || !rec %in% colnames(rec_mat)) next
+
+      lig_vec <- lig_mat[, lig]
+      rec_vec <- rec_mat[, rec]
+
+      n_lig_nonzero <- sum(lig_vec > 0)
+      n_rec_nonzero <- sum(rec_vec > 0)
+
+      if (n_lig_nonzero < 100 || n_rec_nonzero < 100) {
+        tier2_sp_results[[length(tier2_sp_results) + 1]] <- data.frame(
+          sender_celltype = sender_ct,
+          receiver_celltype = receiver_ct,
+          ligand = lig,
+          receptor = rec,
+          tier2_sp_rho_spearman = NA_real_,
+          tier2_sp_pval_spearman = NA_real_,
+          tier2_sp_rho_pearson = NA_real_,
+          tier2_sp_pval_pearson = NA_real_,
+          tier2_sp_n_cells = n_cancer,
+          tier2_sp_n_lig_nonzero = n_lig_nonzero,
+          tier2_sp_n_rec_nonzero = n_rec_nonzero,
+          stringsAsFactors = FALSE
+        )
+        next
+      }
+
+      # Correlate across all cancer cells (including zeros)
+      cor_spearman <- cor.test(log1p(lig_vec), rec_vec, method = "spearman")
+      cor_pearson <- cor.test(log1p(lig_vec), rec_vec, method = "pearson")
+
+      tier2_sp_results[[length(tier2_sp_results) + 1]] <- data.frame(
+        sender_celltype = sender_ct,
+        receiver_celltype = receiver_ct,
+        ligand = lig,
+        receptor = rec,
+        tier2_sp_rho_spearman = cor_spearman$estimate,
+        tier2_sp_pval_spearman = cor_spearman$p.value,
+        tier2_sp_rho_pearson = cor_pearson$estimate,
+        tier2_sp_pval_pearson = cor_pearson$p.value,
+        tier2_sp_n_cells = n_cancer,
+        tier2_sp_n_lig_nonzero = n_lig_nonzero,
+        tier2_sp_n_rec_nonzero = n_rec_nonzero,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+}
+
+tier2_sp_df <- bind_rows(tier2_sp_results)
+rownames(tier2_sp_df) <- NULL
+
+cat("Tier 2 spatial tests completed:", nrow(tier2_sp_df), "\n")
+cat("Tests with sufficient non-zero observations:", sum(!is.na(tier2_sp_df$tier2_sp_rho_spearman)), "\n")
+```
+
+## Per-Sample Consistency Check (Spatial Connectivities)
+
+Test whether LR colocalization is consistent across samples. For each sample, compute the same correlations and report effect sizes.
+
+```{r tier2_sp_per_sample}
+cat("Running per-sample Tier 2 correlation tests (spatial connectivities)...\n")
+
+# Get unique samples
+samples <- unique(obs_df$sample_id[!is.na(obs_df$sample_id)])
+cat("Samples:", length(samples), "\n")
+print(samples)
+
+tier2_sp_sample_results <- list()
+
+for (samp in samples) {
+  cat("\nProcessing sample:", samp, "\n")
+
+  # Filter to cancer cells in this sample and analysis bins
+  sample_cancer_df <- obs_df %>%
+    filter(!is.na(DC_1_rank), in_analysis, sample_id == samp)
+
+  sample_barcodes <- sample_cancer_df$barcode
+  n_sample <- length(sample_barcodes)
+
+  if (n_sample < 100) {
+    cat("  Skipping - only", n_sample, "cancer cells\n")
+    next
+  }
+  cat("  Cancer cells:", n_sample, "\n")
+
+  # Filter parquet data to this sample's cancer cells
+  niche_pos_sp_samp <- niche_pos_sp_df[barcode %in% sample_barcodes]
+  niche_lig_sp_samp <- niche_lig_sp_df[barcode %in% sample_barcodes]
+
+  # Pre-index barcode positions
+  sample_barcode_idx <- setNames(seq_along(sample_barcodes), sample_barcodes)
+
+  # Loop through cell type pairs
+  for (sender_ct in SENDER_CELLTYPES) {
+    # Subset ligand expression for this sender cell type
+    lig_ct_subset <- niche_lig_sp_samp[cell_type == sender_ct & gene %in% ligand_genes]
+
+    if (nrow(lig_ct_subset) == 0) next
+
+    # Pivot to matrix
+    lig_mat <- matrix(0, nrow = n_sample, ncol = length(ligand_genes),
+                      dimnames = list(sample_barcodes, ligand_genes))
+    for (g in intersect(ligand_genes, unique(lig_ct_subset$gene))) {
+      g_subset <- lig_ct_subset[gene == g]
+      lig_mat[sample_barcode_idx[g_subset$barcode], g] <- g_subset$value
+    }
+
+    for (receiver_ct in RECEIVER_CELLTYPES) {
+      # Subset receptor fraction for this receiver cell type
+      rec_ct_subset <- niche_pos_sp_samp[cell_type == receiver_ct & gene %in% receptor_genes]
+
+      if (nrow(rec_ct_subset) == 0) next
+
+      # Pivot to matrix
+      rec_mat <- matrix(0, nrow = n_sample, ncol = length(receptor_genes),
+                        dimnames = list(sample_barcodes, receptor_genes))
+      for (g in intersect(receptor_genes, unique(rec_ct_subset$gene))) {
+        g_subset <- rec_ct_subset[gene == g]
+        rec_mat[sample_barcode_idx[g_subset$barcode], g] <- g_subset$fraction
+      }
+
+      # Loop through LR pairs
+      for (i in seq_len(nrow(LR_PAIRS))) {
+        lig <- LR_PAIRS$ligand[i]
+        rec <- LR_PAIRS$receptor_gene[i]
+
+        if (!lig %in% colnames(lig_mat) || !rec %in% colnames(rec_mat)) next
+
+        lig_vec <- lig_mat[, lig]
+        rec_vec <- rec_mat[, rec]
+
+        n_lig_nonzero <- sum(lig_vec > 0)
+        n_rec_nonzero <- sum(rec_vec > 0)
+
+        # Require at least 30 non-zero for per-sample (relaxed threshold)
+        if (n_lig_nonzero < 30 || n_rec_nonzero < 30) {
+          tier2_sp_sample_results[[length(tier2_sp_sample_results) + 1]] <- data.frame(
+            sample_id = samp,
+            sender_celltype = sender_ct,
+            receiver_celltype = receiver_ct,
+            ligand = lig,
+            receptor = rec,
+            rho_spearman = NA_real_,
+            pval_spearman = NA_real_,
+            rho_pearson = NA_real_,
+            pval_pearson = NA_real_,
+            n_cells = n_sample,
+            n_lig_nonzero = n_lig_nonzero,
+            n_rec_nonzero = n_rec_nonzero,
+            stringsAsFactors = FALSE
+          )
+          next
+        }
+
+        # Correlate
+        cor_spearman <- cor.test(log1p(lig_vec), rec_vec, method = "spearman")
+        cor_pearson <- cor.test(log1p(lig_vec), rec_vec, method = "pearson")
+
+        tier2_sp_sample_results[[length(tier2_sp_sample_results) + 1]] <- data.frame(
+          sample_id = samp,
+          sender_celltype = sender_ct,
+          receiver_celltype = receiver_ct,
+          ligand = lig,
+          receptor = rec,
+          rho_spearman = cor_spearman$estimate,
+          pval_spearman = cor_spearman$p.value,
+          rho_pearson = cor_pearson$estimate,
+          pval_pearson = cor_pearson$p.value,
+          n_cells = n_sample,
+          n_lig_nonzero = n_lig_nonzero,
+          n_rec_nonzero = n_rec_nonzero,
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+}
+
+tier2_sp_sample_df <- bind_rows(tier2_sp_sample_results)
+rownames(tier2_sp_sample_df) <- NULL
+
+cat("\n=== Per-Sample Results ===\n")
+cat("Total tests:", nrow(tier2_sp_sample_df), "\n")
+cat("Tests with results:", sum(!is.na(tier2_sp_sample_df$rho_spearman)), "\n")
+```
+
+```{r tier2_sp_sample_consistency}
+# Summarize consistency across samples for each LR × cell type combination
+cor_threshold = 0.1
+consistency_df <- tier2_sp_sample_df %>%
+  filter(!is.na(rho_spearman)) %>%
+  group_by(sender_celltype, receiver_celltype, ligand, receptor) %>%
+  summarize(
+    n_samples = n(),
+    n_positive = sum(rho_spearman > cor_threshold, na.rm = TRUE),
+    n_sig_positive = sum(rho_spearman > cor_threshold & pval_spearman < 0.05, na.rm = TRUE),
+    mean_rho_spearman = mean(rho_spearman, na.rm = TRUE),
+    sd_rho_spearman = sd(rho_spearman, na.rm = TRUE),
+    min_rho_spearman = min(rho_spearman, na.rm = TRUE),
+    max_rho_spearman = max(rho_spearman, na.rm = TRUE),
+    mean_rho_pearson = mean(rho_pearson, na.rm = TRUE),
+    sd_rho_pearson = sd(rho_pearson, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    frac_positive = n_positive / n_samples,
+    frac_sig_positive = n_sig_positive / n_samples,
+    consistent = frac_positive >= 0.75 | frac_positive <= 0.25  # >75% agree on direction
+  )
+
+cat("\n=== Consistency Summary ===\n")
+cat("LR × cell type combinations tested in >=2 samples:", sum(consistency_df$n_samples >= 2), "\n")
+cat("Consistent direction (>=75% agree):", sum(consistency_df$consistent & consistency_df$n_samples >= 2), "\n")
+cat("Consistently positive (>=75% samples positive):",
+    sum(consistency_df$frac_positive >= 0.75 & consistency_df$n_samples >= 2), "\n")
+cat("Consistently sig positive (>=75% samples sig positive):",
+    sum(consistency_df$frac_sig_positive >= 0.75 & consistency_df$n_samples >= 2), "\n")
+
+# Join consistency metrics to main tier2_sp_df
+tier2_sp_df <- tier2_sp_df %>%
+  left_join(
+    consistency_df %>% select(sender_celltype, receiver_celltype, ligand, receptor,
+                               n_samples, frac_positive, frac_sig_positive,
+                               mean_rho_spearman, sd_rho_spearman, consistent),
+    by = c("sender_celltype", "receiver_celltype", "ligand", "receptor")
+  )
+
+cat("\nJoined consistency metrics to tier2_sp_df\n")
+```
+
+```{r tier2_sp_sample_heatmap, fig.width=10, fig.height=8}
+# Heatmap of per-sample correlations for top consistent LR pairs
+top_consistent <- consistency_df %>%
+  filter(n_samples >= 3, frac_positive >= 0.75, mean_rho_spearman > 0.05) %>%
+  arrange(desc(mean_rho_spearman)) %>%
+  head(30)
+
+if (nrow(top_consistent) > 0) {
+  # Get per-sample rhos for these pairs
+  top_sample_data <- tier2_sp_sample_df %>%
+    inner_join(top_consistent %>% select(sender_celltype, receiver_celltype, ligand, receptor),
+               by = c("sender_celltype", "receiver_celltype", "ligand", "receptor")) %>%
+    mutate(lr_label = paste0(ligand, "→", receptor, " (", sender_celltype, "→", receiver_celltype, ")"))
+
+  # Pivot to matrix
+  sample_mat <- top_sample_data %>%
+    select(lr_label, sample_id, rho_spearman) %>%
+    pivot_wider(names_from = sample_id, values_from = rho_spearman) %>%
+    tibble::column_to_rownames("lr_label") %>%
+    as.matrix()
+
+  # Plot heatmap
+  col_fun <- colorRamp2(c(-0.3, 0, 0.3), c("#4575b4", "white", "#d73027"))
+
+  ht <- Heatmap(
+    sample_mat,
+    col = col_fun,
+    name = "Spearman ρ",
+    cluster_rows = TRUE,
+    cluster_columns = TRUE,
+    show_row_names = TRUE,
+    row_names_gp = gpar(fontsize = 7),
+    show_column_names = TRUE,
+    column_names_gp = gpar(fontsize = 9),
+    column_title = "Per-Sample LR Colocalization (Spatial 60μm)",
+    na_col = "grey90",
+    rect_gp = gpar(col = "lightgrey", lwd = 0.3)
+  )
+
+  draw(ht)
+
+  # Save
+  svg(file.path(FIG_DIR, "tier2_sp_per_sample_consistency_heatmap.svg"), width = 10, height = 8)
+  draw(ht)
+  dev.off()
+  cat("Saved per-sample consistency heatmap\n")
+}
+```
+
+```{r save_per_sample_results}
+# Save per-sample results
+write.csv(tier2_sp_sample_df, file.path(SAVE_DIR, "lr_dc1_tier2_sp_per_sample.csv"), row.names = FALSE)
+write.csv(consistency_df, file.path(SAVE_DIR, "lr_dc1_tier2_sp_sample_consistency.csv"), row.names = FALSE)
+cat("Saved per-sample results to:", SAVE_DIR, "\n")
+```
+
+```{r}
+# read if necessary
+consistency_df = readr::read_csv(file.path(SAVE_DIR, "lr_dc1_tier2_sp_sample_consistency.csv"))
+```
+
+
+---
+
+# Join Spatial Consistency to Tier 1 Results
+
+Join the per-sample consistency metrics from spatial connectivities to Tier 1 LM results for filtering.
+
+## load data
+
+```{r}
+# load if necessary
+lm_df_tier1 = read.csv(file.path(SAVE_DIR, "lr_dc1_lm_results_tier1.csv"), h = T, stringsAsFactors = F)
+dc1_corr_df = read.csv(file.path(FIG_DIR, 'untreated_dc1_pearson_correlation.csv'), h = T, stringsAsFactors  = F)
+# read if necessary
+consistency_df = readr::read_csv(file.path(SAVE_DIR, "lr_dc1_tier2_sp_sample_consistency.csv"))
+#tier1_data = readRDS(file.path(SAVE_DIR, "lr_bin_summaries_tier1.rds")) # need to run early part of preprocessing up to filtering diagnostics to get this
+```
+
+
+```{r join_consistency_to_tier1}
+# Join consistency_df to lm_df_tier1
+lm_df_tier1_with_consistency <- lm_df_tier1 %>%
+  left_join(
+    consistency_df %>% select(sender_celltype, receiver_celltype, ligand, receptor,
+                               n_samples, n_positive, n_sig_positive,
+                               frac_positive, frac_sig_positive,
+                               mean_rho_spearman, sd_rho_spearman, consistent),
+    by = c("sender_celltype", "receiver_celltype", "ligand", "receptor")
+  )
+
+cat("Joined consistency metrics to lm_df_tier1\n")
+cat("Total associations:", nrow(lm_df_tier1_with_consistency), "\n")
+cat("With consistency data:", sum(!is.na(lm_df_tier1_with_consistency$n_samples)), "\n")
+cat("Number of ligands tested:", length(unique(lm_df_tier1_with_consistency$ligand)), "\n")
+cat("Number of receptors tested:", length(unique(lm_df_tier1_with_consistency$receptor)), "\n")
+cat("Number of cell types tested:", length(unique(lm_df_tier1_with_consistency$sender_celltype)), "\n") # should be equal between sender and receiver
+```
+```{r}
+# write out for supp
+write.csv(lm_df_tier1_with_consistency, file = file.path('basal_ablation/data/processed/xenium/niche_trajectory_classical_pruned_d24_filterv2_d1rm', 'lr_dc1_tier1_with_consistency.csv'), quote = F, row.names = F)
+```
+
+
+```{r tier1_vs_consistency_comparison}
+# Define Tier 1 significance criteria
+TIER1_PADJ <- 0.01
+TIER1_SLOPE_MIN <- 0
+TIER1_PCT_LIG_MIN <- 0.1
+TIER1_PCT_REC_MIN <- 0.1
+MIN_N_POSITIVE <- 2
+
+# Identify Tier 1 significant associations
+tier1_sig <- lm_df_tier1_with_consistency %>%
+  filter(padj < TIER1_PADJ, slope > TIER1_SLOPE_MIN,
+         pct_expressing.ligand > TIER1_PCT_LIG_MIN,
+         pct_expressing.receptor > TIER1_PCT_REC_MIN)
+
+cat("\n=== Tier 1 Significant Associations ===\n")
+cat("Total Tier 1 significant:", nrow(tier1_sig), "\n")
+
+# Apply n_positive filter
+tier1_with_consistency <- tier1_sig %>%
+  filter(!is.na(n_positive), n_positive >= MIN_N_POSITIVE)
+
+cat("After n_positive >=", MIN_N_POSITIVE, "filter:", nrow(tier1_with_consistency), "\n")
+
+# Identify removed associations
+tier1_removed <- tier1_sig %>%
+  filter(is.na(n_positive) | n_positive < MIN_N_POSITIVE)
+
+cat("\n=== Associations REMOVED by n_positive filter ===\n
+")
+cat("Removed:", nrow(tier1_removed), "associations\n")
+
+if (nrow(tier1_removed) > 0) {
+  cat("\nRemoved associations (showing key columns):\n")
+  tier1_removed %>%
+    dplyr::select(sender_celltype, receiver_celltype, ligand, receptor, pathway,
+           slope, padj, n_samples, n_positive, mean_rho_spearman) %>%
+    dplyr::arrange(desc(slope)) %>%
+    print(n = 50)
+
+  # Breakdown by reason
+  cat("\n--- Breakdown of removals ---\n")
+  cat("No consistency data (NA):", sum(is.na(tier1_removed$n_positive)), "\n")
+  cat("n_positive = 0:", sum(tier1_removed$n_positive == 0, na.rm = TRUE), "\n")
+  cat("n_positive = 1:", sum(tier1_removed$n_positive == 1, na.rm = TRUE), "\n")
+  cat("n_positive = 2:", sum(tier1_removed$n_positive == 2, na.rm = TRUE), "\n")
+
+  # Summarize by ligand
+  cat("\n--- Removed by ligand ---\n")
+  tier1_removed %>%
+    dplyr::count(ligand, sort = TRUE) %>%
+    head(20) %>%
+    print()
+
+  # Summarize by sender-receiver pair
+  cat("\n--- Removed by sender→receiver ---\n")
+  tier1_removed %>%
+    dplyr::count(sender_celltype, receiver_celltype, sort = TRUE) %>%
+    head(15) %>%
+    print()
+  
+  cat("\n--- Removed by sender ---\n")
+  tier1_removed %>%
+    dplyr::count(sender_celltype, sort = TRUE) %>%
+    head(15) %>%
+    print()
+  
+  cat("\n--- Removed by receiver ---\n")
+  tier1_removed %>%
+    dplyr::count(receiver_celltype, sort = TRUE) %>%
+    head(15) %>%
+    print()
+  
+  cat("\n--- how many distinct ligand pairs ---\n")
+  tier1_removed %>%
+    dplyr::select(ligand, receptor) %>%
+    distinct() %>%
+    nrow() %>%
+    print()
+  
+}
+
+# Save the filtered results
+write.csv(tier1_with_consistency,
+          file.path(SAVE_DIR, "lr_dc1_tier1_with_spatial_consistency_filtered.csv"),
+          row.names = FALSE)
+cat("\nSaved filtered results to:", file.path(SAVE_DIR, "lr_dc1_tier1_with_spatial_consistency_filtered.csv"), "\n")
+```
+
+---
+
+# Ligand heatmaps (with spatial consistency filter)
+
+```{r ligand_heatmaps_dc1_correlated, fig.width=12, fig.height=10}
+# Get ligands with |rho| > 0.1 on DC1 from cancer cells
+cancer_dc1_corr <- dc1_corr_df %>%
+  filter(cell_type == "Cancer_epithelial", abs(rho) > 0.1)
+
+# Get ligands with significant positive Tier 1 associations (cancer as sender)
+# NOW USING CONSISTENCY-FILTERED DATA
+sig_cancer_sender <- tier1_with_consistency %>%
+  filter(sender_celltype == "Cancer_epithelial")
+
+# Find ligands meeting both criteria
+dc1_pos_ligands <- cancer_dc1_corr %>% filter(rho > 0.1) %>% pull(gene) %>% unique()
+dc1_neg_ligands <- cancer_dc1_corr %>% filter(rho < -0.1) %>% pull(gene) %>% unique()
+sig_tier1_ligands <- unique(sig_cancer_sender$ligand)
+
+# Intersect with Tier 1 significant ligands
+pos_corr_ligands <- intersect(dc1_pos_ligands, sig_tier1_ligands)
+neg_corr_ligands <- intersect(dc1_neg_ligands, sig_tier1_ligands)
+
+cat("DC1 positively correlated ligands (rho > 0.1) with sig Tier 1 + consistency:", length(pos_corr_ligands), "\n")
+cat("DC1 negatively correlated ligands (rho < -0.1) with sig Tier 1 + consistency:", length(neg_corr_ligands), "\n")
+
+
+# how many LR interactions in each direction
+sig_pos <- tier1_with_consistency %>%
+    filter(sender_celltype == "Cancer_epithelial",
+           ligand %in% pos_corr_ligands) %>%
+    nrow() %>%
+    print()
+
+sig_neg <- tier1_with_consistency %>%
+    filter(sender_celltype == "Cancer_epithelial",
+           ligand %in% neg_corr_ligands) %>%
+    nrow() %>%
+    print()
+
+```
+
+### with spatial consistency filter (n_positive >= 2)
+
+```{r ligand_heatmap_dc1_positive_consistent, fig.width=12, fig.height=30}
+# Heatmaps for DC1-positive correlated ligands (cancer sender, with consistency filter)
+if (length(pos_corr_ligands) > 0) {
+  sig_pos <- tier1_with_consistency %>%
+    filter(sender_celltype == "Cancer_epithelial",
+           ligand %in% pos_corr_ligands) %>%
+    arrange(desc(slope))
+
+  if (nrow(sig_pos) > 0) {
+    cat("Plotting DC1-positive correlated ligands:", nrow(sig_pos), "pairs\n")
+
+    plot_lr_heatmap_celltype(
+      sig_df = sig_pos,
+      sender_celltype_bins = sender_celltype_bins,
+      rec_celltype_bins = rec_celltype_bins,
+      cov_bins = cov_bins,
+      DC1_N_BINS = DC1_N_BINS,
+      title_suffix = "DC1+ Correlated Ligands (Cancer Sender, n_pos>=2)",
+      file_suffix = "ligand_dc1_pos_cancer_sender_consistent",
+      FIG_DIR = FIG_DIR,
+      x_axis_label = X_LAB, 
+      format = 'pdf'
+    )
+  }
+} else {
+  cat("No DC1-positive correlated ligands with significant Tier 1 + consistency.\n")
+}
+```
+
+```{r ligand_heatmap_dc1_negative_consistent, fig.width=12, fig.height=20}
+# Heatmaps for DC1-negative correlated ligands (cancer sender, with consistency filter)
+if (length(neg_corr_ligands) > 0) {
+  sig_neg <- tier1_with_consistency %>%
+    filter(sender_celltype == "Cancer_epithelial",
+           ligand %in% neg_corr_ligands) %>%
+    arrange(desc(slope))
+
+  if (nrow(sig_neg) > 0) {
+    cat("Plotting DC1-negative correlated ligands:", nrow(sig_neg), "pairs\n")
+
+    plot_lr_heatmap_celltype(
+      sig_df = sig_neg,
+      sender_celltype_bins = sender_celltype_bins,
+      rec_celltype_bins = rec_celltype_bins,
+      cov_bins = cov_bins,
+      DC1_N_BINS = DC1_N_BINS,
+      title_suffix = "DC1- Correlated Ligands (Cancer Sender, n_pos>=2)",
+      file_suffix = "ligand_dc1_neg_cancer_sender_consistent",
+      FIG_DIR = FIG_DIR,
+      x_axis_label = X_LAB, 
+      format = 'pdf'
+    )
+  }
+} else {
+  cat("No DC1-negative correlated ligands with significant Tier 1 + consistency.\n")
+}
+```
+
+
+
+---
+
+# Cytokine Ligand-Response Program Analysis
+
+## Compute Program Scores for All Cell Types
+
+```{r compute_program_scores}
+# Compute mean program expression for each cell
+cat("Computing cytokine program scores for all cell types...\n")
+
+for (prog_name in names(cytokine_signatures)) {
+  prog_genes <- cytokine_signatures[[prog_name]]
+  prog_genes_in_panel <- prog_genes[prog_genes %in% var_names]
+
+  if (length(prog_genes_in_panel) < 2) next
+
+  # Get gene indices
+  gene_idx <- which(var_names %in% prog_genes_in_panel)
+
+  # Mean log1p expression across program genes
+  obs_df[[paste0("program_", prog_name)]] <- rowMeans(log1p_mat[, gene_idx, drop = FALSE])
+}
+
+program_cols <- grep("^program_", names(obs_df), value = TRUE)
+cat("Computed", length(program_cols), "program scores\n")
+```
+
+
+
+```{r cytokine_heatmap, fig.width=12, fig.height=10}
+# Heatmap of significant positive correlations
+sig_corr_pos <- corr_df %>%
+  dplyr::filter(padj < 0.05, rho > 0.3) %>%
+  arrange(program, desc(rho))
+
+if (nrow(sig_corr_pos) > 0) {
+  plot_cytokine_correlation_heatmap(
+    corr_df = sig_corr_pos,
+    expr_bins = sender_celltype_bins,
+    cov_bins = cov_bins,
+    DC1_N_BINS = DC1_N_BINS,
+    title = "Ligand-Program Positive Correlations",
+    file_suffix = "positive",
+    FIG_DIR = FIG_DIR
+  )
+}
+```
+
+---
+
+
+
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+```
