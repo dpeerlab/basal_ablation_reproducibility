@@ -8,7 +8,7 @@ Below is a description of the directory contents.
 
 # Notebooks
 
-## DE
+**DE**
 
 Code related to differential expression in Fig S4A. 
 
