@@ -12,11 +12,11 @@ Below is a description of the directory contents.
 
 Code related to differential expression in Fig S4A. 
 
-## niche_emb
+*niche_emb*
 
 Code related to filtering and construction of niche trajectories from niche embedding outputs of Wormhole. Notebooks relate to either the untreated setting (`notebooks/niche_emb/BA_mingle_untreated_niche_trajectory.ipynb`, Fig. 4B) or after ablation setting (`notebooks/niche_emb/BA_mingle_full_epi_trajectory_responsePruned.ipynb`, `notebooks/niche_emb/BA_mingle_classical_niche_trajectory.ipynb`, Fig. 6A-C). 
 
-## rl
+*rl*
 
 Code related to ligand and receptor, effector cell frequency or composition, and gene to DC correlation analysis along untreated or classical response axis referenced in Fig. 4C-F, Fig. 5A, S3, S5, S7, S8. 
 
